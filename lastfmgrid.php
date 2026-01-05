@@ -5,7 +5,7 @@
  * Description: Create a 3x3 grid of album art from your Last.fm top albums.
  * Author:      Collin Sasse
  * Author URI:  https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress/
- * Version:     1.1.0
+ * Version:     1.1.2
  * Requires at least: 5.2
  * Update URI:  https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress/
  */
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
 }
 
 final class CS_LastFM_3x3_Grid_Plugin {
-	const VERSION      = '1.1.0';
+	const VERSION      = '1.1.2';
 	const SHORTCODE    = 'show_lastfm_3x3_grid';
 	const STYLE_HANDLE = 'cs-lastfm-3x3-grid';
 
@@ -25,6 +25,10 @@ final class CS_LastFM_3x3_Grid_Plugin {
 	// Plugin defaults (also used as defaults for new installs).
 	const DEFAULT_SIZE   = 'medium';
 	const DEFAULT_PERIOD = '1month';
+
+	// Cache housekeeping.
+	const TRANSIENT_PREFIX   = 'cs_lastfm_3x3_';
+	const CACHE_EPOCH_OPTION = 'cs_lastfm_3x3_cache_epoch'; // bump to invalidate all cached variants.
 
 	private static $allowed_sizes   = array('small', 'medium', 'large');
 	private static $allowed_periods = array('overall', '7day', '1month', '3month', '6month', '12month');
@@ -37,6 +41,10 @@ final class CS_LastFM_3x3_Grid_Plugin {
 			add_action('admin_menu', array(__CLASS__, 'admin_menu'));
 			add_action('admin_init', array(__CLASS__, 'register_settings'));
 			add_filter('plugin_action_links_' . plugin_basename(__FILE__), array(__CLASS__, 'action_links'));
+
+			// Clear cache whenever this plugin's option is updated.
+			add_action('update_option_' . self::OPTION_NAME, array(__CLASS__, 'bump_cache_epoch'), 10, 2);
+			add_action('add_option_' . self::OPTION_NAME, array(__CLASS__, 'bump_cache_epoch'), 10, 2);
 		}
 	}
 
@@ -44,39 +52,59 @@ final class CS_LastFM_3x3_Grid_Plugin {
 	 * Frontend assets + shortcode
 	 * --------------------------*/
 
-	public static function register_assets() {
-		wp_register_style(self::STYLE_HANDLE, false, array(), self::VERSION);
+public static function register_assets() {
+	wp_register_style(self::STYLE_HANDLE, false, array(), self::VERSION);
 
-		$css = '
+	$css = '
+		.cs-lastfm-grid{
+			/* Natural (desktop) tile size comes from --cs-lastfm-tile-natural */
+			--cs-lastfm-tile: var(--cs-lastfm-tile-natural, 64px);
+
+			display:inline-grid;
+			grid-template-columns:repeat(3, var(--cs-lastfm-tile));
+			gap:6px;
+			max-width:100%;
+		}
+
+		.cs-lastfm-grid__img{
+			width:var(--cs-lastfm-tile);
+			height:var(--cs-lastfm-tile);
+			display:block;
+			border-radius:6px;
+			object-fit:cover;
+		}
+
+		.cs-lastfm-grid__note{
+			font-size:0.95em;
+			opacity:.85;
+		}
+		@media (max-width: 480px){
 			.cs-lastfm-grid{
-				display:grid;
-				grid-template-columns:repeat(3,1fr);
-				gap:6px;
-				max-width:420px;
+				/*
+				 * Available width ≈ 100vw - 24px (page padding guess) - 2 gaps (12px)
+				 * Divide by 3 columns => per-tile max that fits without overflow.
+				 */
+				--cs-lastfm-tile: clamp(
+					24px,
+					calc((100vw - 36px) / 3),
+					var(--cs-lastfm-tile-natural, 64px)
+				);
 			}
-			.cs-lastfm-grid__img{
-				width:100%;
-				height:auto;
-				display:block;
-				border-radius:6px;
-			}
-			.cs-lastfm-grid__note{
-				font-size:0.95em;
-				opacity:.85;
-			}
-		';
+		}
+	';
 
-		wp_add_inline_style(self::STYLE_HANDLE, $css);
-	}
+	wp_add_inline_style(self::STYLE_HANDLE, $css);
+}
+
 
 	public static function render_shortcode($atts) {
 		wp_enqueue_style(self::STYLE_HANDLE);
 
 		$settings = self::get_settings();
 
+		// Shortcode allows overriding size/period, but username/key come from admin settings.
 		$atts = shortcode_atts(
 			array(
-				// Allow shortcode overrides, otherwise use defaults.
 				'size'   => $settings['default_size'],
 				'period' => $settings['default_period'],
 			),
@@ -101,8 +129,10 @@ final class CS_LastFM_3x3_Grid_Plugin {
 			return '<span class="cs-lastfm-grid__note">Last.fm grid: set your username and API key in <strong>Settings → Last.fm Grid</strong>.</span>';
 		}
 
-		// Cache HTML so the page doesn't call Last.fm on every load.
-		$cache_key = 'cs_lastfm_3x3_' . md5($username . '|' . $api_key . '|' . $size . '|' . $period . '|' . self::VERSION);
+		$epoch = self::get_cache_epoch();
+
+		// Cache is keyed by user + size + period + epoch. When settings change, epoch bumps => cache invalidates.
+		$cache_key = self::TRANSIENT_PREFIX . md5($username . '|' . $size . '|' . $period . '|' . $epoch . '|' . self::VERSION);
 		$cached = get_transient($cache_key);
 		if (is_string($cached) && $cached !== '') {
 			return $cached;
@@ -122,6 +152,8 @@ final class CS_LastFM_3x3_Grid_Plugin {
 			return '<span class="cs-lastfm-grid__note">Last.fm grid: no albums found.</span>';
 		}
 
+		$tile_px = self::size_to_pixels($size);
+
 		$imgs  = array();
 		$count = 0;
 
@@ -133,7 +165,8 @@ final class CS_LastFM_3x3_Grid_Plugin {
 				continue;
 			}
 
-			$img_url = self::get_album_image_url($album, $size);
+			// Choose the correct API-provided URL for the requested size
+			$img_url = self::get_album_image_url_by_size($album, $size);
 			if ($img_url === '') {
 				continue;
 			}
@@ -164,7 +197,12 @@ final class CS_LastFM_3x3_Grid_Plugin {
 			return '<span class="cs-lastfm-grid__note">Last.fm grid: album images unavailable.</span>';
 		}
 
-		$html = '<div class="cs-lastfm-grid" aria-label="Last.fm top albums">' . implode('', $imgs) . '</div>';
+$html = sprintf(
+	'<div class="cs-lastfm-grid" style="--cs-lastfm-tile-natural:%dpx" aria-label="Last.fm top albums">%s</div>',
+	(int) $tile_px,
+	implode('', $imgs)
+);
+
 
 		$ttl = (int) apply_filters('cs_lastfm_3x3_grid_cache_ttl', HOUR_IN_SECONDS);
 		if ($ttl < 60) {
@@ -222,30 +260,78 @@ final class CS_LastFM_3x3_Grid_Plugin {
 		return $data;
 	}
 
-	private static function get_album_image_url(array $album, $size) {
+	private static function size_to_pixels($size) {
+		// Matches Last.fm typical returns: small=34s, medium=64s, large=174s.
+		switch ($size) {
+			case 'small':
+				return 34;
+			case 'large':
+				return 174;
+			case 'medium':
+			default:
+				return 64;
+		}
+	}
+
+	/**
+	 * Select the correct image URL by matching the API's image[].size field.
+	 */
+	private static function get_album_image_url_by_size(array $album, $requested_size) {
 		if (!isset($album['image']) || !is_array($album['image'])) {
 			return '';
 		}
 
-		// Prefer matching "size" key.
+		// Exact match first.
 		foreach ($album['image'] as $img) {
 			if (!is_array($img)) {
 				continue;
 			}
-			if (isset($img['size'], $img['#text']) && (string) $img['size'] === $size && (string) $img['#text'] !== '') {
+			if (
+				isset($img['size'], $img['#text']) &&
+				(string) $img['size'] === (string) $requested_size &&
+				(string) $img['#text'] !== ''
+			) {
 				return (string) $img['#text'];
 			}
 		}
 
-		// Fallback: last non-empty.
-		$best = '';
-		foreach ($album['image'] as $img) {
-			if (is_array($img) && isset($img['#text']) && (string) $img['#text'] !== '') {
-				$best = (string) $img['#text'];
+		// Fall back: large -> medium -> small -> any non-empty.
+		$fallback_order = array('large', 'medium', 'small');
+		foreach ($fallback_order as $size) {
+			foreach ($album['image'] as $img) {
+				if (
+					is_array($img) &&
+					isset($img['size'], $img['#text']) &&
+					(string) $img['size'] === $size &&
+					(string) $img['#text'] !== ''
+				) {
+					return (string) $img['#text'];
+				}
 			}
 		}
 
-		return $best;
+		foreach ($album['image'] as $img) {
+			if (is_array($img) && isset($img['#text']) && (string) $img['#text'] !== '') {
+				return (string) $img['#text'];
+			}
+		}
+
+		return '';
+	}
+
+	/* ---------------------------
+	 * Cache invalidation
+	 * --------------------------*/
+
+	private static function get_cache_epoch() {
+		$epoch = (int) get_option(self::CACHE_EPOCH_OPTION, 1);
+		return $epoch > 0 ? $epoch : 1;
+	}
+
+	public static function bump_cache_epoch($old_value = null, $new_value = null) {
+		// Incrementing an epoch option invalidates all transients without needing DB-wide wildcard deletion.
+		$epoch = self::get_cache_epoch();
+		update_option(self::CACHE_EPOCH_OPTION, $epoch + 1, false);
 	}
 
 	/* ---------------------------
@@ -283,8 +369,9 @@ final class CS_LastFM_3x3_Grid_Plugin {
 			'cs_lastfm_grid_main',
 			'Last.fm Settings',
 			function () {
+				$help = 'https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress/';
 				echo '<p>Enter your Last.fm username and API key once, then use the shortcode anywhere.</p>';
-				echo '<p>For setup directions, please <a href="https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress/"/>click here.</a></p><br><br><br>';
+				echo '<p>For setup directions, please <a href="' . esc_url($help) . '">click here</a>.</p><br><br><br>';
 				echo '<p><code>[show_lastfm_3x3_grid size="medium" period="1month"]</code></p><br><br>';
 			},
 			self::MENU_SLUG
@@ -390,12 +477,13 @@ final class CS_LastFM_3x3_Grid_Plugin {
 
 	public static function field_api_key() {
 		$s = self::get_settings();
+		$help = 'https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress/';
 		printf(
 			'<input type="text" class="regular-text" name="%s[api_key]" value="%s" autocomplete="off" />',
 			esc_attr(self::OPTION_NAME),
 			esc_attr($s['api_key'])
 		);
-		echo '<p class="description">This is your API key, not the shared secret. Please visit <a href="https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress/"/>here</a> for directions and to get a key.</p>';
+		echo '<p class="description">This is your API key, not the shared secret. Please visit <a href="' . esc_url($help) . '">here</a> for directions and to get a key.</p>';
 	}
 
 	public static function field_default_size() {
@@ -431,6 +519,8 @@ final class CS_LastFM_3x3_Grid_Plugin {
 			return;
 		}
 
+		$help = 'https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress/';
+
 		echo '<div class="wrap">';
 		echo '<h1>Last.fm Grid</h1>';
 		echo '<form method="post" action="options.php">';
@@ -448,8 +538,8 @@ final class CS_LastFM_3x3_Grid_Plugin {
 		echo '<p class="description">Accepted size: small, medium, large. <br>Accepted period: overall, 7day, 1month, 3month, 6month, 12month.</p>';
 
 		echo '</div>';
-		
-		echo '<br><br><br><br><big>If you are using this plugin, please consider <a href="https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress"/>buying me a coffee as a thank-you</a>. Also, this plugin does not auto-update, please <a href="https://collinsasse.com/wordpress-plugins/last-fm-3x3-album-art-image-grid-for-wordpress"/>check my website</a> every now and then for updates, fixes, and changes.</big>';
+
+		echo '<br><br><br><br><big>If you are using this plugin, please consider <a href="' . esc_url($help) . '">buying me a coffee as a thank-you</a>. Also, this plugin does not auto-update, please <a href="' . esc_url($help) . '">check my website</a> every now and then for updates, fixes, and changes.</big>';
 	}
 }
 
